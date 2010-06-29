@@ -1,0 +1,344 @@
+# This recipes file is in the YAML format - see: http://www.yaml.org/
+# Whitesapce _is_ important in this file...
+
+#template: 
+#  desc: "a brief description of the command"
+#  depends: "this is a space separated list of depends. 'a b c' or's cab done with | 'a b|c':  can be used to make a recipe impotent, like this one. A recipe can be limted to target xx_x by dependancy Txx_x or the opposite with T-xx_x."
+#  command: "the command to run"
+#  result: "RE: or RUBY: or KSH: to interpret the output"
+#  tests: "RE:/RUBY:/KSH:/ tests to set status variables from the output"
+#  uid: "uid to run the test as: will add a su - xxx or whatever"
+
+# main probes
+
+normal:
+  command: ':'
+  flags: nosave
+
+willfail:
+  command: ';'
+  flags: nosave
+
+willfail2:
+  depends: willfail
+  command: ":"
+  flags: nosave
+
+unix:
+  depends: normal
+  command: uname -a
+  tests:
+    linux: 'RE: ^Linux '
+    sunos: 'RE: ^SunOS '
+    aix: 'RE: ^AIX '
+    hpux: 'RE: ^HP-UX '
+
+debian: 
+  depends: normal linux
+  command: 'cat /etc/debian_version'
+  tests:
+    lenny: 'RE: lenny'
+    sid: 'RE: sid'
+
+redhat: 
+  depends: normal linux
+  command: 'cat /etc/redhat-release'
+  tests:
+    el4: "RE: release 4"
+    el5: "RE: release 5"
+
+informix: 
+  depends: normal
+  command: '[ -d "/opt/informix" ]'
+
+apache: 
+  depends: normal
+  command: 'for q in /etc/apache{,2} /etc/httpd{,2} /opt/apache{,2}; do [ -f "${q}/conf/httpd.conf" ] && echo $q; done|tail -1'
+
+orbis: 
+  depends: normal
+  command: '[ -d "/opt/orbis" ]'
+
+# GENERIC STUFF
+multipath: 
+  depends: normal linux
+  test: "type -p multipath"
+  command: "multipath -ll"
+  desc: "Run the multipath tool to get info about any multipath devices"
+
+log_autosave: 
+  desc: Autosave log
+  depends: normal
+  command: cat /var/backup/AUTOSAVE.log
+
+log_fs: 
+  command: cat /var/backup/fs.log
+  depends: normal
+  desc: FS log
+
+diskspace: 
+  desc: list all mounted filesystems and space used/free
+  depends: normal
+  command: df -k
+
+informix_onstat_gdri: 
+  desc: Informix ???
+  depends: normal informix
+  command: su - informix -c "onstat -g dri"
+
+informix_onstat_giov: 
+  depends: normal informix
+  command: su - informix -c "onstat -g iov"
+  desc: Informix ???
+
+informix_onstat_l: 
+  depends: normal informix
+  command: su - informix -c "onstat -l"
+  uid: informix
+  desc: Check the status of Informix logs
+
+informix_onstat_m: 
+  command: su - informix -c "onstat -m"
+  desc: Informix ???
+  depends: normal informix
+
+informix_onstat_gseg: 
+  command: su - informix -c "onstat -g seg"
+  desc: Informix ???
+  depends: normal informix
+
+informix_onstat_p: 
+  command: su - informix -c "onstat -p"
+  desc: Informix ???
+  depends: normal informix
+
+fdisk_l: 
+  depends: normal unix
+  command: fdisk -l
+  desc: List of partition tables
+
+mounts: 
+  depends: normal unix
+  command: mount
+  desc: list all mounted filesystem mounts
+
+backup_ls: 
+  depends: normal unix
+  command: ls -lrt /backup/fs
+  desc: List the on disk backups
+
+dmesg: 
+  depends: normal unix
+  desg: dmesg - kernel message dump
+  command: dmesg
+
+uptime: 
+  depends: normal unix
+  command: uptime
+  desc: System uptime and load averages
+
+date: 
+  depends: normal unix
+  command: date
+  desc: System time and date
+
+clock: 
+  depends: normal unix
+  command: clock
+  desc: System hardware time and date
+
+rpm_packages:
+  desc: "Installed RPM packages and versions"
+  depends: normal redhat
+  command: "rpm -qa|sort"
+
+dpkg_packages:
+  desc: "Installed DEB packages and versions"
+  depends: normal debian
+  command: "dpkg -l|sort"
+
+prtconf:
+  depends: normal
+  command: "prtconf"
+
+bootinfo:
+  depends: normal aix
+  command: "bootinfo -y && bootinfo -r"
+
+lsattr:
+  depends: normal aix
+  depends: ignore
+  command: "lsattr -1 rmt0 -E"
+
+lscfg:
+  depends: normal
+  command: "lscfg"
+
+lspv:
+  depends: normal
+  command: "lspv"
+  nb: should make this provide more info about specific devices
+
+lslv:
+  depends: normal
+  command: "lslv"
+  nb: should make this provide more info about specific devices
+
+lsvg:
+  depends: normal
+  command: "lsvg"
+  nb: should make this provide more info about specific devices
+
+vgs:
+  depends: linux
+  command: vgs
+
+pvs:
+  depends: linux vgs
+  command: pvs
+
+lvs:
+  depends: linux vgs
+  test: "type -p lvs"
+  command: lvs
+
+pvdisplay:
+  depends: linux vgs
+  test: "type -p pvdisplay"
+  command: pvdisplay
+
+vgdisplay:
+  depends: linux vgs
+  command: vgdisplay
+
+lvdisplay:
+  depends: linux vgs
+  command: lvdisplay
+
+oslevel:
+  depends: normal
+  command: "oslevel -r && oslevel -s"
+
+lslpp:
+  depends: normal
+  command: "lslpp -h box.rts && lslpp -l"
+
+instafix:
+  depends: normal
+  command: "instafix"
+
+lsdev:
+  depends: normal
+  command: "lsdev -Cc if"
+
+ifconfig:
+  depends: normal -aix
+  command: ifconfig -a
+
+netstat:
+  depends: normal
+  command: netstat -rn
+
+groups:
+  depends: normal unix
+  command: cat /etc/group
+
+passwd:
+  depends: normal unix
+  command: cat /etc/passwd
+
+# zfs
+
+storage_chk:
+  depends: normal informix
+  test: '[ -f "/home/informix/storage_chk.sh" ]' 
+  command: 'su - informix -c "storage_chk.sh "'
+
+tune2fs:
+  depends: normal linux
+  command: 
+
+cmdline:
+  depends: normal linux
+  command: cat /proc/cmdline
+
+cpuinfo:
+  depends: normal linux
+  command: cat /proc/cpuinfo
+
+meminfo:
+  depends: normal linux
+  command: cat /proc/meminfo
+
+mdstat:
+  depends: normal linux
+  command: cat /proc/mdstat
+
+devices:
+  depends: normal linux
+  command: cat /proc/devices
+
+partitions:
+  depends: normal linux
+  command: 
+  - "cat /proc/partitions"
+
+interrupts:
+  depends: normal linux
+  command: cat /proc/interrupts
+
+ioports:
+  depends: normal linux
+  command: cat /proc/ioports
+
+modules:
+  depends: normal linux
+  command: cat /proc/modules
+
+mounts:
+  depends: normal linux
+  command: cat /proc/mounts
+
+swaps:
+  depends: normal linux
+  command: cat /proc/swaps
+
+mount:
+  depends: normal unix
+  command: mount
+
+id:
+  depends: normal unix
+  command: id -a
+
+who:
+  depends: normal unix
+  command: who
+
+w:
+  depends: normal unix
+  command: w
+
+crontabs:
+  depends: normal unix
+  command: "[ -d '/var/spool/cron/' ] && cd /var/spool/cron/;[ -d '/var/spool/cron/crontabs' ] && cd /var/spool/cron/crontabs; ls|grep -v \\\."
+
+crontab:
+  loop_on_recipe: crontabs
+  command: "crontab -l LOOPVAR||crontab -l -u LOOPVAR"
+
+utils:
+  command:
+  - "git --version 2>/dev/null||true"
+  - "ruby --version 2>/dev/null||true"
+  - "screen --version 2>/dev/null||true"
+  - "ssh -V||true"
+
+sys_find:
+  depends: normal linux
+  command: "find /sys -ls"
+
+proc_scsi_scsi:
+  depends: normal linux
+  command: "cat /proc/scsi/scsi"
+

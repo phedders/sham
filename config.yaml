@@ -1,0 +1,9 @@
+# This config file is in the YAML format - see: http://www.yaml.org/
+# Whitesapce is important in this file...
+#
+# You can put a similar file in the repo in branch meta
+# But you probably want to put one in $HOME/.shamrc
+
+# eg:
+#repodir: /opt/gits/sham-data.git
+

@@ -1,0 +1,627 @@
+#!/usr/bin/ruby1.9.1
+#!/usr/bin/ruby1.8
+#!/usr/bin/env ruby
+#!/usr/bin/ruby
+# == Copyright
+# Written by Paul Hedderly @ ardenta.com
+# Copyright Ardenta.com 2008 - licence undecided.
+#
+# == System Health Auditing Munger
+# A program to login to a remote system and grab as much information as possible,
+# then dump it into a git repository so that we can check status, detec
+# problems, look for potential problems etc.
+#
+# This program fetches data (at the moment using SSH - but should be able to do it locally too) from a (remote) system
+# and stores all the data in a git repository. Multiple systems from multiple clients can all be stored in the same repo,
+# and the complete history of changes can be checked also.
+#
+# == TODO
+#   - Make it do local fetches (shell/sudo) as well as ssh
+#   - Give options to clear out old history. This may have to be done with a shallow clone, but there is the possiblity
+#   to clean down -daily and -perf mode branches which are going to be potentially much larger.
+#   - Make it run git-gc --aggressive periodically.
+#   - Write a CGI front end, or use a git web front end...
+#   - Finish the filters feature - could use external filter macros
+#   - Make it use classes and objects. sigh :O)
+#   - move the ssh connection stuff into the target loop?
+#   - create http / snmp targets
+#   - add options to run a specified recipe or command list...
+#   - give a summary ( unless -q )
+#   - option to not ask for passwords (-B ?)
+#
+# == Notes
+#  sham [opts] [targets]
+#    target => [group_][user[:password]@][hostname][=ip_address][:port][%via]
+#    Information is cached so on subsequent use, only group and hostname are required
+#    ie group_target
+
+$V=0022
+$debug=2
+puts "SHAM Version ${V} running under Ruby ${RUBY_VERSION} - debug level ${debug}"
+
+def sham_init
+  # Require relevant gems
+  require "rubygems" if RUBY_VERSION == "1.8.7"
+  %w(digest/sha2 highline/import lockfile hashie net/ssh net/ssh/telnet openssl optparse pathname pp time tempfile yaml).each {|l| require l}
+  if ARGV == [] then system "#{$0} --help";
+    #RDoc::usage("Notes");
+    exit 0; end
+  @output = Hashie::Mash.new
+  @targets = Hashie::Mash.new
+  @recipes = Hashie::Mash.new
+  @config = Hashie::Mash.new
+  @config.callingdir = Dir.pwd
+  @config.progdir = File.dirname(Pathname.new($0).realpath)
+  @config.mode="full"
+  $: << @config.progdir
+  $: << @config.progdir+"/prh-rlib/lib"
+
+  require "prh-misc"
+  require "prh-ssl"
+  require "prh-ssh"
+  require "prh-grit"
+  require "tmpdir187"
+  require "#{@config.progdir}/defs.rb" if File.exists?("#{@config.progdir}/defs.rb")
+  require "~/.sham/defs.rb" if File.exists?("~/.sham/defs.rb")
+  require "/etc/sham/defs.rb" if File.exists?("~/.sham/defs.rb")
+end
+
+def main
+  sham_init
+  debug 6, "SHAM: start"
+  load_config_progdir
+  load_config_personal
+  dummy,user,host=ARGV[0].match(/(.+)@(.+)'s password$/).to_a
+  if dummy
+    # We got called as SSH_ASKPASS so do not process options any further
+    # just look up user for host - host will probably be an ip address
+    puts "password"
+    # TO BE COMPLETED
+    exit
+  end
+  @config.merge! parseopts
+  check_repo
+  @grit=Grit::Repo.new(@config.repodir)
+  load_config_repodir
+  load_targets(@targets)
+  load_recipes(@recipes)
+
+  debug 6, "SHAM: process targets list"
+  if @config.alltargets 
+    @config.do_targets = @targets.keys.grep(/_/)
+  else
+    debug 6, "SHAM: Expanding targets"
+    @config.do_targets = @config.do_targets.map{|q| tmp=@targets.keys.grep(/_/).grep(Regexp.new(q)); tmp.empty? ? q : tmp}.flatten
+  end
+  @config.do_targets = @targets.keys.grep(/_/) if @config.do_targets.empty?
+  debug 7, "Targets:",@targets.keys
+  debug 6, "DOTargets:",@config.do_targets
+
+  @config.do_all_targets = @config.do_targets # keep this for reenabling...!
+  @config.do_targets = @config.do_targets.select{|t| @targets[t].nil? or not @targets[t].disabled}
+
+  case @config.action 
+  when "list" then @config.do_targets.each {|target| @target=target; list_diff}
+  when "targets" then list_targets(@targets,@config.do_all_targets)
+  when "enable" then enable_targets(@targets,@config.do_all_targets)
+  when "disable" then disable_targets(@targets,@config.do_targets)
+  when "recipes" then list_recipes(@recipes)
+  when "delete" then delete_targets(@targets,@config.do_targets)
+  when "ssh" then ssh_for_user(@targets,@config.do_targets, false)
+  when "sshnr" then ssh_for_user(@targets,@config.do_targets, true)
+  else
+      debug 6, "ready to go..."
+      get_master_password if @config.getpassword
+      @config.do_targets.each do |target| @target=target
+        debug 1, "TARGET: #{@target}"
+        state = query_configs(@target,@targets)
+        ssh = get_ssh(state)
+        if ssh
+          debug 2, "ssh ok"
+          unless @targets[state.target].user == "root" or (@targets[state.target].flags and @targets[state.target].flags.match(/nosu/))
+            get_root_password(state)
+            sshroot = ssh.execplus!("id", state.rootpass || nil )
+            if sshroot["all"].grep(/(root)/).empty?
+              debug 2, "Failed to get root..."
+              next
+            end
+            debug 3, "su ok"
+          end
+          target_loop(state)
+          ssh.close 
+        else
+          debug 1, "Could not connect.... NEXT!"
+        end
+      end
+  end
+
+  save_targets(@targets)
+end
+
+def self.parseopts
+  opt = OptionParser.new
+  opts = Hashie::Mash.new
+  opts.do_targets = []
+  #  opt.on('-C','--config CONFIG',"Location of config file to use") { |c| opts.config = c }
+  opt.on('-A','--all',"Carry out action on _all_ known targets")  { opts.alltargets = true } # this is unnessecary - regex . does the same
+  opt.on('-g','--git GIT',"SHAM working Repository")  { |r| opts.repodir = r }
+  #opt.on('-o','--origin REPO',"SHAM origin Repository")  { |r| opts.repoorigin = r } # wasnt working, and not really needed for now
+  opt.on("-m", "--mode", "Set the mode (full/daily/perf)") {|m| opts.mode = m }
+  opt.on("-M", "--master", "Force request of the master password") { opts.getpassword = true }
+  opt.on("-p", "--userpass", "Force setting of the user password") { opts.askuserpass = true }
+  opt.on("-P", "--rootpass", "Force setting of the root password") { opts.askrootpass = true }
+  opt.on("-v", "--[no-]verbose", "Run verbosely") { opts.verbose += 1 }
+  opt.on("", "--delete", "Delete targets") {|d| opts.action = "delete" }
+  opt.on("-D", "--debug", "Increase debugging") {|d| $debug += 1 }
+  opt.on("-l", "--last", "Just show the last diff") { opts.action = "last" }
+  opt.on('-a','--audit',"Audit the results")  { opts.audit = true }
+  opt.on("-T", "--targets", "List known targets") { opts.action = "targets" }
+  opt.on("-s", "--ssh", "Start an SSH session") { opts.action = "ssh" }
+  opt.on("-S", "--sshnoroot", "Start an SSH session but do not try to get root") { opts.action = "sshnr" }
+  opt.on("-R", "--recipes", "List known recipes") { opts.action = "recipes" }
+  opt.on("-E", "--disable", "Disable target(s)") { opts.action = "disable" }
+  opt.on("-e", "--enable", "Enable target(s)") { opts.action = "enable" }
+  opt.on("-c", "--command COMMAND", "Run command(s)") { |c| opts.commands ||= []; opts.command << c }
+  opt.on("-r", "--recipe RECIPE", "Run recipes(s)") { |r| opts.recipes ||= []; opts.recipes << r }
+  opt.on("-b", "--batch", "Request nothing... for running in batch mode") { opts.batch = true }
+  opt.on("-q", "--quiet", "Shhh") { $debug = 0 }
+  opt.on_tail("-h", "--help", "Show this message") { puts opt; exit }
+  opt.parse!(ARGV)
+  opts.do_targets += ARGV
+  opts
+end
+
+def load_config_progdir
+  config = Hashie::Mash.new(YAML.load_file("#{@config.progdir}/config.yaml")) if File.exists?("#{@config.progdir}/config.yaml")
+  config.repodir ||= "#{@config.progdir}/sham-data.git"
+  @config.merge! config unless config.nil?
+end
+
+def load_config_personal
+  config = Hashie::Mash.new(YAML.load_file("#{ENV["HOME"]}/.shamrc")) if File.exists?("#{ENV["HOME"]}/.shamrc")
+  Dir.glob("{#{@config.progdir},#{ENV["HOME"]}/.sham-,#{ENV["HOME"]}/.sham/}recipes{,-*}.yaml").each do |file|
+    @recipes.deep_update Hashie::Mash.new(YAML.load_file(file))
+    File.open("/tmp/foo","w") { |f| f << @recipes.to_yaml }
+  end
+  @config.merge! config unless config.nil?
+end
+
+def load_config_repodir
+  debug 6, "SHAM: load_config_repodir"
+  if @grit.data("config.yaml")
+    config = Hashie::Mash.new(YAML.load(@grit.data("config.yaml")))
+    @config.merge! config unless config.nil?
+  end
+end
+
+def load_recipes(recipes)
+  debug 6, "Load recipes from the program directory."
+  Dir.glob("{#{@config.progdir}/,#{ENV["HOME"]}/.sham-,#{ENV["HOME"]}/.sham/}recipes{,-*}.yaml").each do |file|
+    debug 4, "Found recipe file #{file}"
+    recipes.deep_update Hashie::Mash.new(YAML.load_file(file))
+    File.open("/tmp/foo","w") { |f| f << @recipes.to_yaml }
+  end
+  unless @grit.commits("recipes").empty?
+    @grit.commits("recipes")[0].tree.contents.each do |file|
+      debug 0, "Found gitted recipe file #{file.name}"
+      recipes.deep_update Hashie::Mash.new(YAML.load(file.data))
+    end
+  end
+end
+
+def load_targets(targets)
+  debug 6, "SHAM: load_targets"
+  @grit.commits("targets")[0].tree.contents.each {|c| targets[c.name] = YAML.load(c.data)} unless @grit.commits("targets").empty?
+  @targetsorig = @targets.dup
+end
+
+def save_targets(targets)
+  return if targets == @targetsorig
+  debug 1, "Comparing targets for changes"
+  targets.each_key do |k|
+    #puts "#{@targetsorig[k].to_yaml}\nBECOMES\n#{@targets[k].to_yaml}\n" if k == "test2_lh"
+    if @targetsorig[k].nil? or targets[k] != @targetsorig[k]
+      i=@grit.index
+      i.add(k,targets[k].to_yaml)
+      i.hcommit("Changed target #{k}","targets")
+      debug 2, "Updated target #{k}\n"
+    end
+  end
+  @targetsorig = @targets.dup
+  #debug 1, "Updated the targets files\n"
+end
+
+def check_repo
+  #unless File.exists?("#{@config.repoorigin}/.git/config") or File.exists?("#{@config.repoorigin}/config") or @config.repoorigin.match(/^ssh:|^git:/)
+  #  p "There is no origin repository - please set one up"
+  #  exit 81
+  #  # Not sure how to do this all now...
+  #  p "Creating SHAM data ORIGIN repository #{@config.repoorigin} as a bare repository"
+  #  Dir.mktmpdir do |tmpdir|
+  #    tmpgit = Git.init(tmpdir)
+  #    tmpgit.chdir { `git commit -m "zero" --allow-empty` }
+  #    tmpgit.add_tag("zero")
+  #    Dir.mkdir(File.dirnam(@config.repoorigin)) rescue nil
+  #    origin=Git.clone(tmpdir, @config.repoorigin, :bare => true)
+  #  end
+  #end
+  unless File.exists? "#{@config.repodir}/config"
+    p "The repository does not exist or is not complete... please create"
+    exit 82
+    # Will redo this...
+    p "Cloning SHAM data repository to #{@config.repodir}"
+    Dir.mkdir(File.dirnam(@config.repodir)) rescue nil
+    @repo=Git.clone(@config.repoorigin, @config.repodir)
+  end
+end
+
+def tidy_string(string)
+  string.to_s.gsub(/^\W*(.*)\W$/,$1.to_s)
+end
+
+def or_nil(obj)
+  return nil unless defined? obj and not obj.nil? and not obj.empty?
+end
+
+def query_configs(target,targets)
+  state = Hashie::Mash.new
+  debug 4, "SHAM query_configs #{target}"
+  # [client_][user[:password]@]host[=ip][:port][%via]
+  regex = /^(?:([^_]*)\_)?(?:([^@%]*)(?:[:%]([^@%:]+))?@)?([^_%@:=]+)(?:=([^=:%]+))?(?::(\d+))?(?:%([^:%@]+))?$/
+  match = target.match(regex)
+  debug 6, match
+  client = match[1] || tidy_string(ask(">>> Client?") {|q| q.readline=true})
+  host = match[4] || tidy_string(ask(">>> Host?") {|q| q.readline=true})
+  state.target="#{client}#{client ? "_": ""}#{host}"
+  targets[state.target] ||= Hashie::Mash.new
+  targets[state.target].client ||= client
+  targets[state.target].host ||= host
+  targets[state.target].ip = match[5] || targets[state.target].ip || ask(">>> #{state.target} IP []?") {|q| q.readline=true}
+  targets[state.target].user = match[2] || targets[state.target].user || or_nil(ask(">>> #{state.target} User [root]?") {|q| q.readline=true}) || "root"
+  targets[state.target].port = match[6] || targets[state.target].port || or_nil(ask(">>> #{state.target} Port [22]?") {|q| q.readline=true}) || "22"
+  state.userpass = match[3] if match[3]
+  state.branch = state.target + "_" + (defined?(@config.mode) ? @config.mode : "full")
+   ".#{@config.mode}" 
+  targets[state.target].viassh = match[7] || targets[state.target].viassh
+  debug 4, state
+  state
+end
+
+def get_master_password
+  debug 5, "SHAM: get_master_password"
+  test = Proc.new {|pass| simple_decrypt(@targets.master.iv, @targets.master.test, pass)}
+  unless @targets.master and @targets.master.test and @targets.master.iv
+    @targets.master=Hashie::Mash.new
+    @config.masterpassword = ask(">> Master password to create?") {|q| q.echo=false}
+    if crypt = simple_encrypt(nil,`uptime`,@config.masterpassword)
+      @targets.master.iv = crypt[:iv]
+      @targets.master.test = crypt[:data]
+    end
+  end
+  return if @config.masterpassword and test.call(@config.masterpassword)
+  @config.masterpassword = ENV["shampass"] if ENV["shampass"] and not ENV["shampass"].empty?
+  return if @config.masterpassword and test.call(@config.masterpassword)
+  @config.masterpassword = ask("Master password?") {|q| q.echo=false}
+  return if @config.masterpassword and test.call(@config.masterpassword)
+  debug 3, "get_master_password failed"
+  nil
+end
+
+def try_ssh(state,auth_methods = ["publickey","hostbased","password"])
+  debug 5, "SHAM: try_ssh"
+  opts = {} unless opts
+  opts.merge @config.ssh_opts if @config.ssh_opts
+  opts[:password] = state.userpass if state.userpass
+  opts[:port] = @targets[state.target].port if @targets[state.target].port
+  opts[:forward_agent] = true
+  opts[:verbose] = :warn
+  opts[:auth_methods] = auth_methods
+  ip = (not @targets[state.target].ip.empty?) ? @targets[state.target].ip : @targets[state.target].host
+  user = (not @targets[state.target].user.empty?) ? @targets[state.target].user : "root"
+  begin
+    return Net::SSH.start(ip, user, opts)
+  rescue
+    debug 3, "SSH failed '#{$!.inspect}'"
+  end
+end
+
+def get_ssh(state)
+  debug 5, "SHAM: get_ssh"
+  state = Hashie::Mash.new unless state
+  unless @targets[state.target].usercrypt
+    state.ssh = try_ssh(state)
+    return state.ssh if state.ssh
+    p "Notice Failed to connect without a password"
+  end
+
+  get_master_password
+
+  @targets[state.target].usercrypt = nil if @config.askuserpass
+
+  if state.userpass or not @targets[state.target].usercrypt
+    unless @targets[state.target].usercrypt
+      state.userpass = ask(">> #{state.target} #{@targets[state.target].user} password?") {|q| q.echo = false} unless state.userpass
+    end
+    if crypt = simple_encrypt(@targets.master.iv, state.userpass, @config.masterpassword)
+      @targets[state.target].usercrypt = crypt[:data]
+    end
+  end
+
+  state.userpass = simple_decrypt(@targets.master.iv, @targets[state.target].usercrypt, @config.masterpassword)
+  state.ssh = try_ssh(state)
+  return state.ssh if state.ssh
+
+  pp "FAILED to connect to #{state.target}:",state
+  nil
+end
+
+def get_root_password(state)
+  debug 5, "SHAM: get_root_password"
+  get_master_password
+
+  @targets[state.target].rootcrypt = nil if @config.askrootpass
+  
+  unless @targets[state.target].rootcrypt
+    state.rootpass = ask(">> #{state.target} root password?") {|q| q.echo = false}
+    if crypt = simple_encrypt(@targets.master.iv, state.rootpass, @config.masterpassword)
+      @targets[state.target].rootcrypt = crypt[:data]
+    end
+  end
+  state.rootpass = simple_decrypt(@targets.master.iv, @targets[state.target].rootcrypt, @config.masterpassword)
+  state
+end
+
+def target_loop(state)
+  target = state.target
+  debug 6, "DEF:target_loop"
+  state.recipe = Hashie::Mash.new
+  status = state.status = Hashie::Mash.new
+  audit = state.audit = Hashie::Mash.new
+
+  # we need to count the failures and repeat until the failures stop going away
+  fails_previous=nil
+  recipes_done=[]
+  index=@grit.index # start the Git work
+  begin
+    fails=[];
+    @recipes.sort_by{|n,r|n}.each do |r_name,rec|
+      next unless rec.command # is this always going to be good practise?
+      next unless status[r_name].nil? # done this already
+
+      # DEPENDANCIES - watch out, some tricksy lojik in here...
+      depends = (rec.depends ? rec.depends.split(/[ ,:]/) : []) + ( rec.loop_on_recipe ? rec.loop_on_recipe.split(/[ ,:]/) : [])
+      next if depends.any? do |d|
+        debug 7, "DEP4 #{target}/#{r_name} =  #{rec.depends}\n"
+        d.gsub!(/^-/,""); neg = $& == '-' ? true : false
+
+        # Check deps for T_ (ie check for a target)
+        d.gsub(/^T/) do d1 = $'
+          d2 = d1.gsub(/^-/,''); d3 = d1 == d2
+          status[d] = true if (d3 and target =~ Regexp.new(d2)) or (!d3 and target !~ Regexp.new(d2))
+          debug 6, "#{r_name} #{d} #{status[d]} #{target} #{d1} #{d2} #{d3}" 
+        end
+
+        if neg ^ d.split(/\|/).any? {|dd| (status[dd].nil? and not neg) or status[dd] == false }
+          debug 7,"FAILED #{r_name} #{d}\n"
+          fails << r_name
+          true
+        else
+          debug 7,"PASSED #{r_name} #{d}\n"
+          false
+        end 
+      end
+
+      # now actually do stuff - but first build the list of recipes by loop if necessary
+      if rec.loop_on_recipe
+        nlist = state.recipe[rec.loop_on_recipe].last[:out].to_s.split(/\n/).map{|q| q.chomp!}.select{|q| ! q.nil?}
+      else
+        nlist = [r_name]
+      end
+      nlist.each do |na|
+        nl = rec.loop_on_recipe ? "#{r_name}_#{na}" : na
+        #print "#{nl}. #{na}" if $debug < 5
+        state.recipe[nl] = []
+
+        (rec.command.class == String ? [rec.command] : rec.command).each do |cmd|
+          # Do any LOOPVAR supstitutions
+          cmd.gsub!(/LOOPVAR/,na) if rec.loop_on_recipe
+          state.recipe[nl] << state.ssh.execplus!(cmd, state.rootpass || nil )
+        end
+
+        debug 5, "R: #{nl} #{state.recipe[nl].last[:status]} #{state.recipe[nl].last[:signal]}"
+  
+        # check restult and other tests
+        status[nl] = if @targets[state.target].result 
+                      dotest(state.recipe[nl].map{|l| l.all}.join("/n"), @targets[state.target].result) 
+                    else
+                      state.recipe[nl].last.status == 0 ? true : false
+                    end
+        rec.tests.each { |tn,tt| tr = dotest(state.recipe[nl].last[:out].join, tt); status[tn] = tr if tr } if rec.tests
+
+        print status[nl] ? "+" : "_"
+        debug(3," recipe #{nl}")
+  
+        unless rec.flags and rec.flags.match("nosave")
+          index.add(nl, state.recipe[nl].map{|e| e[:all]}.join)
+          recipes_done << nl
+        end
+      end
+    end
+    done = fails.length == fails_previous
+    fails_previous = fails.length
+    debug 5, "FAILS... #{fails_previous} #{fails.sort.join ' '}\n" if done
+  end until done
+  print "\n"
+
+  index.add("status", status.sort.map{|q| q.join(",")}.join("\n")+"\n")
+  index.hcommit("SHAM #{@config.mode} update for #{state.branch} #{DateTime.now.to_s}", state.branch)
+
+  # Audit
+  audit(state,recipes_done) if @config.audit
+end
+
+def dotest(data,test)
+  debug 5, "dotest #{data} :: #{test}\n"
+  case test
+  when /^RE:/
+    test = Regexp.new(test.gsub(/^RE: */,""))
+    debug 7, "testing REGEX #{test} == #{data.match(test)} // #{data}\n"
+    return data.match(test)
+  when /^RC:/
+    test = Regexp.new(test.gsub(/^RC: */,""))
+    debug 7, "testing REGEX #{test} == #{data.match(test)} // #{data}\n"
+    code = SerializableProc.new(test)
+    debug 5, "RUNNING CODE: test\n"
+    return code.call(data,test)
+  end
+end
+
+def audit(state,recipes)
+  target=state.target
+  pp target
+  audit_file="audit"
+  audit = File.exists?(audit_file) ? Hashie::Mash.new(YAML.load_file(audit_file)) : Hashie::Mash.new
+  recipes.each do |r|
+    pp "RECIPE #{target} #{r}"
+    diff = `git diff --color HEAD^1 -- #{r}`
+    if diff.match /[\W]/
+      system("{ echo; echo; echo ==== #{target}.#{r} ====; echo; git diff --color HEAD^1 -- #{r}; }|less -ER")
+      audit[target] = Hashie::Mash.new if audit[target].nil?
+      audit[target][r] = Hashie::Mash.new if audit[target][r].nil?
+      debug 5, "Status was : #{audit[target][r].status}\n"
+      audit[target][r].status =
+      ask("What is the current status of #{target}.#{r} [Ok,Warn,Criticl,Known issue]?", %w(o w c k)) {|l| l.character=true}
+      audit[target][r].note = ask("Notes for #{target}.#{r}") {|q| q.readline=true; q.default=audit[target][r].note}
+
+    end
+  end 
+  index=@grit.index
+  index.add(audit_file, audit.to_yaml )
+  index.hcommit("SHAM audit for #{state.branch} #{DateTime.now.to_s}", state.branch)
+end
+
+def list_targets(targets,list)
+  print "Known targets are\n"
+  list.grep(/_/).sort.each do|t|
+    tc=targets[t]
+    puts "#{tc.disabled ? "-" : " "} #{t} (#{tc.client}_#{tc.user}@#{tc.host}"+(tc.ip ? "="+tc.ip : "")+":#{tc.port}"+(tc.viassh ? "%"+tc.viassh : "")+')'
+    debug 6, tc
+  end
+end
+
+def enable_targets(targets,enable)
+  debug 2,"Enabling targets"
+  #targets.keys.grep(/_/).sort.each do|t|
+  enable.each do |t|
+    tc=targets[t]
+    tc.delete("disabled")
+    debug 2, "Enabled #{t}"
+  end
+end
+
+def disable_targets(targets,disable)
+  debug 2,"Disabling targets"
+  #targets.keys.grep(/_/).sort.each do|t|
+  disable.each do |t|
+    tc=targets[t]
+    tc.disabled = true
+    debug 2, "Disabled #{t}"
+  end
+end
+
+def delete_targets(targets,delete)
+  debug 6, "SHAM delete_targets"
+  #targets.keys.grep(/_/).sort.each {|t| print "  #{t} #{'('+targets[t].ip+')' if targets[t].ip}\n"}
+  delete.each do |d| 
+    if targets[d] and agree("delete #{d}?") {|l| l.character = true}
+      puts "Deleting #{d}"
+      targets.delete(d)
+    end
+  end
+end
+
+def list_recipes(recipes)
+  print "Known recipes are\n"
+  recipes.keys.sort.each {|t| print "  #{t}\n"}
+  print "\n"
+end
+
+def ssh_for_user(targets, targets_to_ssh, getroot)
+  expect = <<ENDOFEXPECT
+#!/usr/bin/expect -f
+
+set timeout 1
+set cmd{uname -a}
+
+spawn ssh SUB_SSH
+
+expect_after eof { exit 0 }
+
+set timeout 4
+expect "Are you sure you want to continue connecting" { send "yes\r" } 
+set timeout 13
+expect -re "password: |Password: " { send "SUB_PASSWORD\\r" } \
+  timeout {
+  send_user "Error connecting"
+  exit 1
+}
+
+#xSU send "su -\\r"
+#SU expect -re "password: |Password: " { send "SUB_ROOT_PASSWORD\\r" } \
+#SU   timeout {
+#SU   send_user "Error getting root"
+#SU   exit 1
+#SU }
+
+set timeout 2
+
+expect "TERM has been set to *unknown" { send "export TERM=xterm\\r" }
+#SUB_OTHER
+send "eval stty -raw\r"
+send "#STTY\r"
+
+interact
+ENDOFEXPECT
+
+  stty_erase=`stty -a|sed -ne "s/.* erase = \\([^;]*\\);.*$/\\1/p"`.chomp
+  get_master_password
+  targets_to_ssh.each do |d| 
+    if targets[d] 
+      userpass = simple_decrypt(@targets.master.iv, targets[d].usercrypt, @config.masterpassword)
+      puts "Connecting you to #{d} as #{targets[d].user}#{userpass}"
+      command = ""
+      export_do = expect
+      userpass.gsub!(/\"/, '\"')
+      userpass.gsub!(/\$/, '\$')
+      userpass.gsub!(/\&/, '\&')
+      userpass.gsub!(/\~/, '\~')
+      export_do.gsub!(/SUB_PASSWORD/, userpass)
+      export_do.gsub!(/#STTY/, "stty erase #{stty_erase}")
+      if @targets[d].user != "root" and not getroot
+        rootpass = simple_decrypt(@targets.master.iv, targets[d].rootcrypt, @config.masterpassword)
+        rootpass.gsub!(/\"/, '\"')
+        rootpass.gsub!(/\$/, '\$')
+        rootpass.gsub!(/\&/, '\&')
+        rootpass.gsub!(/\~/, '\~')
+        print "ROOTPASS #{rootpass}\n"
+        export_do.gsub!(/#SU /, '')
+        export_do.gsub!(/SUB_ROOT_PASSWORD/, rootpass)
+        export_do.gsub!(/SUB_SSH/, 'SUB_SSH -t "su -"')
+      end
+      export_do.gsub!(/SUB_SSH/,"-p"+targets[d].port+" "+targets[d].user+"@" +
+      (targets[d].ip.empty? ? targets[d].host : targets[d].ip)).gsub(/SUB_PASSWORD/,userpass)
+      f = Tempfile.new("uhsdlkrni#{$$}")
+      f << export_do
+      f.close
+      system "{ sleep 5; rm #{f.path}; } > /dev/null 2>&1& expect -f #{f.path}; echo $?"
+      f.delete
+    else
+      debug 1, "No such target (#{d})"
+    end
+  end
+  
+
+end
+
+###############################################################################
+main

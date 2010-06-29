@@ -1,0 +1,7 @@
+[submodule "net-ssh-shell"]
+	path = net-ssh-shell
+	url = http://github.com/jamis/net-ssh-shell.git
+
+[submodule "prh-rlib"]
+	path = prh-rlib
+	url = http://github.com/phedders/prh-rlib.git

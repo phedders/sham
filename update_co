@@ -1,0 +1,19 @@
+#!/bin/sh
+
+cd `dirname $0`
+dir=`pwd`
+mkdir -p data
+#echo $dir; exit 0
+
+SRC=$(grep "^ *repodir:" ~/.shamrc|cut -d: -f2)
+
+for q in `GIT_DIR=$SRC git branch|tr '*' ' ' `; do 
+  #echo ============= $q =============
+  cd $dir/data
+  [ -d "$q" ] || git clone -s $SRC $q
+  cd $q
+	git fetch 2>&1 | grep $q
+  git branch |grep -q "^* $q$" || git checkout -f -t -b $q origin/$q 2>&1|grep $q
+  git pull 2>&1 | grep $q
+done
+  
